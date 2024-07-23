@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+
+"""
+Starlink Satellite Direction Finder
+-----------------------------------
+
+This script fetches the current locations of Starlink satellites and determines the optimal direction
+to point a dish from a given location based on the highest density of satellites.
+It calculates the average azimuth and elevation for the satellites in the highest density direction.
+
+Usage:
+- Run the script with a UK postcode to get the optimal direction for pointing the dish.
+- Example: ./ssdf SW1A 1AA
+
+License: MIT License
+"""
+
+import requests
+import math
+import cmath  # For handling complex numbers in circular mean calculation
+from collections import Counter
+from datetime import datetime
+import sys
+import re
+
+# ANSI color codes for terminal output
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+def print_header(text):
+    print(f"\n{Colors.HEADER}{Colors.BOLD}{text}{Colors.ENDC}")
+
+def print_subheader(text):
+    print(f"{Colors.BLUE}{text}{Colors.ENDC}")
+
+def print_info(label, value):
+    print(f"{Colors.BOLD}{label}:{Colors.ENDC} {value}")
+
+def get_location_info(postcode):
+    """
+    Fetches the latitude, longitude, admin_ward, admin_district, and region for a given UK postcode using the Postcodes.io API.
+    """
+    response = requests.get(f"https://api.postcodes.io/postcodes/{postcode}")
+    data = response.json()
+    if response.status_code == 200 and data['status'] == 200:
+        result = data['result']
+        return (result['latitude'], result['longitude'], result['admin_ward'], result['admin_district'], result['region'])
+    else:
+        raise ValueError(f"Could not fetch data for postcode: {postcode}")
+
+def get_elevation(lat, lon):
+    """
+    Fetches the elevation for a given latitude and longitude using the Open-Elevation API.
+    """
+    response = requests.get(f"https://api.open-elevation.com/api/v1/lookup?locations={lat},{lon}")
+    data = response.json()
+    if response.status_code == 200 and 'results' in data:
+        return data['results'][0]['elevation']
+    else:
+        raise ValueError(f"Could not fetch elevation data for coordinates: ({lat}, {lon})")
+
+def get_starlink_satellites():
+    """
+    Fetches current data for Starlink satellites from the SpaceX API.
+    """
+    url = "https://api.spacexdata.com/v4/starlink"
+    response = requests.get(url)
+    return response.json()
+
+def calculate_angles(lat1, lon1, lat2, lon2, alt2):
+    """
+    Calculates the azimuth (horizontal angle) and elevation (vertical angle) from a given point (lat1, lon1)
+    to a satellite position (lat2, lon2, alt2).
+    
+    Azimuth is calculated clockwise from true north:
+    0° (or 360°) represents North
+    90° represents East
+    180° represents South
+    270° represents West
+    """
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    
+    dlon = lon2 - lon1
+    
+    y = math.sin(dlon) * math.cos(lat2)
+    x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    azimuth = math.atan2(y, x)
+    azimuth = math.degrees(azimuth)
+    azimuth = (azimuth + 360) % 360  # Normalize to 0-360
+    
+    # Note: We don't need to reverse the azimuth here because we're calculating from ground to satellite
+
+    # Calculate great circle distance
+    a = math.sin((lat2-lat1)/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    distance = 6371 * c  # Earth radius in km
+
+    # Calculate elevation
+    elevation = math.degrees(math.atan2(alt2, distance * 1000))
+    
+    return azimuth, elevation
+
+def calculate_direction(azimuth):
+    """
+    Converts azimuth in degrees to compass direction.
+    """
+    directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+    index = round(azimuth / 22.5) % 16
+    return directions[index]
+
+def haversine(lat1, lon1, lat2, lon2):
+    """
+    Calculates the great-circle distance between two points on the Earth using the Haversine formula.
+    """
+    R = 6371  # Earth radius in kilometers
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+def find_satellite_directions(satellites, lat, lon, max_distance_km):
+    """
+    Finds the count of satellites in each direction (N, NE, E, etc.) within a specified range from a given point (lat, lon).
+    """
+    directions = []
+    satellite_data = []
+    for satellite in satellites:
+        sat_lat = satellite.get('latitude')
+        sat_lon = satellite.get('longitude')
+        sat_alt = satellite.get('height_km', 550)  # Assuming height_km is available in the data, default to 550 km if not
+        if sat_lat is not None and sat_lon is not None:
+            distance = haversine(lat, lon, sat_lat, sat_lon)
+            if distance <= max_distance_km:
+                azimuth, _ = calculate_angles(lat, lon, sat_lat, sat_lon, sat_alt)
+                direction = calculate_direction(azimuth)
+                directions.append(direction)
+                satellite_data.append({
+                    'latitude': sat_lat,
+                    'longitude': sat_lon,
+                    'altitude': sat_alt,
+                    'direction': direction,
+                    'distance': distance
+                })
+    direction_counts = Counter(directions)
+    return direction_counts, satellite_data
+
+def filter_satellites_by_direction(satellite_data, highest_density_direction, lat, lon):
+    """
+    Filters the satellite data to only include satellites in the highest density direction.
+    """
+    filtered_data = []
+    for data in satellite_data:
+        if data['direction'] == highest_density_direction:
+            azimuth, elevation = calculate_angles(lat, lon, data['latitude'], data['longitude'], data['altitude'])
+            filtered_data.append((azimuth, elevation))
+    return filtered_data
+
+def circular_mean(angles):
+    """
+    Calculate the circular mean of a list of angles in degrees.
+    This is necessary because the average of 359° and 1° should be 0°, not 180°.
+    """
+    angles_rad = [math.radians(angle) for angle in angles]
+    mean = cmath.phase(sum(cmath.rect(1, angle) for angle in angles_rad) / len(angles_rad))
+    return (math.degrees(mean) + 360) % 360
+
+def main(geosat):
+    print_header("Starlink Satellite Direction Finder")
+    print_info("Processing postcode", geosat)
+
+    # Validate and normalize postcode
+    uk_postcode_pattern = r'^[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}$'
+    if not re.match(uk_postcode_pattern, geosat, re.IGNORECASE):
+        raise ValueError(f"Invalid postcode format: {geosat}")
+    
+    geosat = geosat.upper()
+    parts = geosat.split()
+    if len(parts) == 1:
+        geosat = f"{geosat[:-3]} {geosat[-3:]}"
+
+    print_info("Normalized postcode", geosat)
+
+    try:
+        # Get location info
+        lat, lon, admin_ward, admin_district, region = get_location_info(geosat)
+        
+        # Get elevation
+        elevation = get_elevation(lat, lon)
+        
+        # Get Starlink satellites data
+        satellites = get_starlink_satellites()
+        
+        # Calculate satellite directions
+        max_distance_km = 1000
+        direction_counts, satellite_data = find_satellite_directions(satellites, lat, lon, max_distance_km)
+
+        if direction_counts:
+            print_header("\nOptimal Dish Direction (Dishy)")
+            highest_density_direction = direction_counts.most_common(1)[0][0]
+            highest_density_count = direction_counts.most_common(1)[0][1]
+            print_info("Highest density direction", f"{highest_density_direction}")
+            print_info("Satellites in this direction", f"{highest_density_count}")
+
+            # Calculate average azimuth and elevation
+            filtered_data = filter_satellites_by_direction(satellite_data, highest_density_direction, lat, lon)
+            azimuths = [item[0] for item in filtered_data]
+            elevations = [item[1] for item in filtered_data]
+
+            if azimuths and elevations:
+                avg_azimuth = circular_mean(azimuths)
+                avg_elevation = sum(elevations) / len(elevations)
+                compass_direction = calculate_direction(avg_azimuth)
+                
+                print_info("Point your Dishy towards", f"{compass_direction}")
+                print_info("Average Azimuth", f"{avg_azimuth:.2f}°")
+                print_info("Average Elevation", f"{avg_elevation:.2f}°")
+            else:
+                print(f"{Colors.YELLOW}No valid satellites found in the {highest_density_direction} direction.{Colors.ENDC}")
+
+            print_header("\nLocation Summary")
+            print_info("Date and Time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            print_info("Admin Ward", admin_ward)
+            print_info("Admin District", admin_district)
+            print_info("Region", region)
+            print_info("Coordinates", f"({lat:.6f}, {lon:.6f})")
+            print_info("Elevation", f"{elevation:.2f} meters")
+
+            print_subheader("\nSatellite distribution in all directions:")
+            for direction, count in direction_counts.most_common():
+                print(f"  {direction}: {count} satellites")
+
+            print_subheader("\nDetailed satellite data:")
+            # Print column headers
+            print(f"{'Satellite':<10}{'Latitude':<12}{'Longitude':<12}{'Altitude (km)':<14}{'Direction':<10}{'Distance (km)':<14}")
+            print("-" * 72)  # Separator line
+            for i, data in enumerate(satellite_data, 1):
+                print(f"{i:<10}"
+                      f"{data['latitude']:<12.6f}"
+                      f"{data['longitude']:<12.6f}"
+                      f"{data['altitude']:<14.2f}"
+                      f"{data['direction']:<10}"
+                      f"{data['distance']:<14.2f}")
+        else:
+            print(f"{Colors.YELLOW}No Starlink satellites found within {max_distance_km} km from {geosat}.{Colors.ENDC}")
+    
+    except Exception as e:
+        print(f"{Colors.RED}An error occurred: {e}{Colors.ENDC}")
+        raise
+
+# Ensure the script is run with a postcode argument
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: ./ssdf <UK_POSTCODE>")
+        sys.exit(1)
+    
+    # Join all arguments after the script name to handle postcodes with spaces
+    geosat = ' '.join(sys.argv[1:])
+    try:
+        main(geosat)
+    except ValueError as e:
+        print(f"{Colors.RED}Error: {e}{Colors.ENDC}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"{Colors.RED}An unexpected error occurred: {e}{Colors.ENDC}")
+        sys.exit(1)
