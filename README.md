@@ -1,7 +1,7 @@
 # sl-satfinder
 
 
-`sl-satfinder` is a Python app I made to find the best direction to point your dish.  You will know if you need this, will be of no interest if you don't.
+`sl-satfinder` app to find the best direction to point starlink dish.  You will know if you need this, will be of no interest if you don't.
 
 ## Basic features
 
